@@ -1,164 +1,87 @@
 import os
-import ssl
-import time
-import random
-import base64
-import hashlib
-import requests
-import uuid
-import json
-import logging
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from flask import Flask, request, jsonify, send_from_directory
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from flask import Flask, request, jsonify
-from werkzeug.security import check_password_hash, generate_password_hash
+import base64
+from functools import wraps
+import logging
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
 
-# Setup logging
-logging.basicConfig(filename='audit.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Load environment variables from .env file
+load_dotenv()
 
-# Decrypt the configuration
-def decrypt_config():
-    with open("config.enc", "rb") as f:
-        encrypted_data = f.read()
-
-    aes_key = hashlib.sha256(b"EynDnmNF4fipxGmiErq0hMOC-lXBuBxgRhIAHQDM8XA").digest()  # AES Key
-    iv = encrypted_data[:16]
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
-    decrypted_data = unpad(cipher.decrypt(encrypted_data[16:]), AES.block_size)
-
-    config = json.loads(decrypted_data.decode())
-    return config
-
-# Encrypt the configuration
-def encrypt_config(config):
-    aes_key = hashlib.sha256(b"EynDnmNF4fipxGmiErq0hMOC-lXBuBxgRhIAHQDM8XA").digest()  # AES Key
-    iv = os.urandom(16)
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
-    encrypted_data = cipher.encrypt(pad(json.dumps(config).encode(), AES.block_size))
-
-    with open("config.enc", "wb") as f:
-        f.write(iv + encrypted_data)
-
-# Load configuration from decrypted config file
-config = decrypt_config()
-
-# Flask App
 app = Flask(__name__)
 
-# User roles and permissions (extended)
-roles_permissions = {
-    "admin": ["view_logs", "run_commands", "upload_files", "download_files", "manage_users"],
-    "operator": ["run_commands", "upload_files", "download_files"],
-    "viewer": ["view_logs"]
-}
+# Access environment variables
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER', 'uploads')
+app.config['ALLOWED_EXTENSIONS'] = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif'}
 
-# Role-based authentication system
-def get_user_role(username):
-    for user in config['users']:
-        if user['username'] == username:
-            return user['role']
-    return None
+# Setup basic logging
+logging.basicConfig(level=logging.INFO)
 
-def check_permission(role, permission):
-    if permission in roles_permissions.get(role, []):
-        return True
-    return False
+# AES encryption setup
+def encrypt_file(file_data):
+    key = app.config['SECRET_KEY'].encode('utf-8')[:16]  # AES key should be 16, 24, or 32 bytes
+    cipher = AES.new(key, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(file_data)
+    return cipher.nonce + tag + ciphertext
 
-# Email alert system
-def send_email_alert(subject, body):
-    sender_email = "youremail@example.com"
-    receiver_email = "alertrecipient@example.com"
-    password = "youremailpassword"
+def decrypt_file(encrypted_data):
+    key = app.config['SECRET_KEY'].encode('utf-8')[:16]
+    nonce, tag, ciphertext = encrypted_data[:16], encrypted_data[16:32], encrypted_data[32:]
+    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
+    return cipher.decrypt_and_verify(ciphertext, tag)
 
-    msg = MIMEMultipart()
-    msg['From'] = sender_email
-    msg['To'] = receiver_email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
+# Decorator for role-based authentication
+def role_required(role):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user_role = os.getenv('USER_ROLE', 'user')  # Default role is user
+            if user_role != role:
+                return jsonify({"error": "Unauthorized"}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
-    try:
-        with smtplib.SMTP('smtp.example.com', 587) as server:
-            server.starttls()
-            server.login(sender_email, password)
-            text = msg.as_string()
-            server.sendmail(sender_email, receiver_email, text)
-            logging.info(f"Email sent: {subject}")
-    except Exception as e:
-        logging.error(f"Error sending email: {e}")
+# Ensure the upload folder exists
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
 
-# Registering client with logging
-def register_client(client_id):
-    # Simulate registration
-    logging.info(f"Client {client_id} registered.")
-    send_email_alert("New Client Registered", f"Client {client_id} has been successfully registered.")
+@app.route('/')
+def home():
+    return "Flask app with environment variables, encryption, and file uploads"
 
-# Commands handling with logging
-@app.route('/command', methods=['POST'])
-def execute_command():
-    user = request.json.get('username')
-    command = request.json.get('command')
-
-    role = get_user_role(user)
-
-    if not role:
-        return jsonify({'status': 'error', 'message': 'Invalid username'}), 403
-
-    if not check_permission(role, 'run_commands'):
-        return jsonify({'status': 'error', 'message': 'Permission denied'}), 403
-
-    # Simulate command execution
-    result = f"Executed command: {command}"
-
-    logging.info(f"Command executed by {user}: {command}")
-    send_email_alert("Command Executed", f"User {user} executed command: {command}")
-
-    return jsonify({'status': 'success', 'result': result})
-
-# File upload (encrypted)
 @app.route('/upload', methods=['POST'])
+@role_required('admin')  # Only admin can upload
 def upload_file():
-    user = request.json.get('username')
-    file_data = request.json.get('file_data')
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    if file and file.filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']:
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # Encrypt file before saving
+        encrypted_file = encrypt_file(file.read())
+        with open(filepath, 'wb') as f:
+            f.write(encrypted_file)
+        return jsonify({"message": "File uploaded successfully"}), 200
+    return jsonify({"error": "File type not allowed"}), 400
 
-    role = get_user_role(user)
+@app.route('/download/<filename>', methods=['GET'])
+@role_required('admin')  # Only admin can download
+def download_file(filename):
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    if os.path.exists(filepath):
+        with open(filepath, 'rb') as f:
+            encrypted_data = f.read()
+            decrypted_data = decrypt_file(encrypted_data)
+            return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
+    return jsonify({"error": "File not found"}), 404
 
-    if not role:
-        return jsonify({'status': 'error', 'message': 'Invalid username'}), 403
-
-    if not check_permission(role, 'upload_files'):
-        return jsonify({'status': 'error', 'message': 'Permission denied'}), 403
-
-    # Simulate file upload
-    encrypted_file_data = encrypt_command(file_data)
-    logging.info(f"File uploaded by {user}")
-    send_email_alert("File Uploaded", f"User {user} uploaded a file.")
-
-    return jsonify({'status': 'success', 'message': 'File uploaded successfully.'})
-
-# Encrypt file data before upload
-def encrypt_command(cmd):
-    iv = os.urandom(16)
-    cipher = AES.new(hashlib.sha256(b"EynDnmNF4fipxGmiErq0hMOC-lXBuBxgRhIAHQDM8XA").digest(), AES.MODE_CBC, iv)
-    return iv + cipher.encrypt(pad(cmd.encode(), AES.block_size))
-
-# Dashboard (Basic authentication for admin)
-@app.route('/dashboard', methods=['GET'])
-def dashboard():
-    username = request.args.get('username')
-    role = get_user_role(username)
-
-    if not role:
-        return jsonify({'status': 'error', 'message': 'Invalid username'}), 403
-
-    if role != 'admin':
-        return jsonify({'status': 'error', 'message': 'Permission denied'}), 403
-
-    # Display dashboard info
-    return jsonify({'status': 'success', 'message': 'Welcome to the dashboard'})
-
-# Start the Flask app
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=config['server']['port'], ssl_context='adhoc' if config['server']['use_https'] else None)
+    app.run(debug=True)
