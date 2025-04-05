@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: flask-c2-server
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app"
-    branch: main  # or master
-    autoDeploy: true

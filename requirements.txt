@@ -1,3 +1,10 @@
+<<<<<<< HEAD
 Flask==2.1.2
 requests==2.27.1
 pycryptodome==3.15.0
+=======
+Flask==2.3.0
+Werkzeug==2.3.0
+pycryptodome==3.10.1
+gunicorn==20.1.0
+>>>>>>> e4788b214d29816f470a5e6f785634b5896109f8
